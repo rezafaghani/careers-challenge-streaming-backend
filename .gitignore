@@ -10,6 +10,8 @@ build/
 .vscode/
 .DS_Store
 *.log
+bin/
+obj/
 .env
 .env.local
 data/snapshots/

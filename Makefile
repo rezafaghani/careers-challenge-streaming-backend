@@ -3,10 +3,14 @@
 PYTHON ?= python3
 SERVICE_URL ?= http://localhost:8080
 
-.PHONY: help example smoke baseline burst offline adversarial
+.PHONY: help run test stress restart-check example smoke baseline burst offline adversarial
 
 help:
 	@echo "Targets:"
+	@echo "  run            start PostgreSQL and the service"
+	@echo "  test           run focused domain checks"
+	@echo "  stress         run a configurable burst and print metrics"
+	@echo "  restart-check  hard-kill the app and verify recovery"
 	@echo "  example        run the example stub service on :8080 (replace with yours)"
 	@echo "  smoke          30s baseline run against \$$SERVICE_URL + scorecard"
 	@echo "  baseline       60s baseline"
@@ -17,6 +21,18 @@ help:
 	@echo "Override SERVICE_URL=... or DEVICES=... as needed."
 
 DEVICES ?= 50
+
+run:
+	docker compose up --build
+
+test:
+	dotnet run --project tests/StreamingBackend.Tests
+
+stress:
+	bash scripts/stress.sh
+
+restart-check:
+	bash scripts/restart-check.sh
 
 example:
 	$(PYTHON) example_solution/service.py

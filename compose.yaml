@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_DB: streaming
+      POSTGRES_USER: streaming
+      POSTGRES_PASSWORD: streaming
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U streaming"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+  app:
+    build: .
+    environment:
+      ConnectionStrings__postgres: Host=postgres;Database=streaming;Username=streaming;Password=streaming;Pooling=true;Maximum Pool Size=200
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  postgres-data:

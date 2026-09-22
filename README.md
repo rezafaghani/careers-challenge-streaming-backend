@@ -1,5 +1,91 @@
 # Teton Challenge, Real-time Streaming Backend
 
+This fork contains a small durable implementation of the challenge in ASP.NET Core and PostgreSQL. The original challenge specification follows after the solution notes below.
+
+## Run
+
+Requirements: Docker with Compose, or Podman Compose.
+
+```bash
+docker compose up --build
+curl http://localhost:8080/metrics
+```
+
+The API is exposed on `http://localhost:8080`. PostgreSQL is private to the Compose network and its named volume survives application restarts.
+
+PostgreSQL is also available from the host at `localhost:5432` with database/user/password `streaming`. Override the host port when needed:
+
+```bash
+POSTGRES_PORT=5433 docker compose up --build
+psql 'postgresql://streaming:streaming@localhost:5432/streaming'
+```
+
+Interactive API documentation is available at `http://localhost:8080/scalar/v1`; the OpenAPI document is at `/openapi/v1.json`.
+
+## Design
+
+`POST /events` validates an event and inserts it into a PostgreSQL inbox with a unique `(device_id, seq)` constraint before returning `202`. A background service claims batches with `FOR UPDATE SKIP LOCKED`, processing fall warnings before ordinary events. The same transaction writes the read model and marks inbox rows processed. A crash rolls that transaction back, so restart simply retries the row. Unique source-event keys make retries harmless.
+
+PostgreSQL is both the durable queue and read store. This avoids an extra broker and any unbounded in-process buffer. Orleans was considered but omitted because database constraints and row claims already provide recoverable ownership without a second state model.
+
+The application is stateless and horizontally scalable. Every replica can ingest and process; workers claim disjoint 500-row batches with `FOR UPDATE SKIP LOCKED`, and each entire batch is applied with one set-based PostgreSQL statement. Put any number of replicas behind an HTTP load balancer and point them at the same PostgreSQL database. Unique constraints make concurrent/retried processing harmless. PostgreSQL is the intentional coordination point; size its connection limit and storage throughput before raising replica count. Compose remains one app plus one database for the simplest local evaluator setup.
+
+All timestamps use `DateTimeOffset`/`timestamptz`. Presence transitions are stored in event-time order. Occupancy queries find the state immediately before the requested window, merge transitions inside it, and integrate occupied time; a late transition therefore corrects historical windows. Device health similarly uses event-time heartbeat rows.
+
+A physical fall is identified by `(device_id, ts)`. This matches the supplied generator, whose 1–3 jitter messages have different sequence numbers but the same timestamp. Every transport event remains in the inbox, while the alarms table keeps one logical alarm with its original timestamp. `GET /alarms?since=...` is the durable reconnect path.
+
+## API
+
+```text
+POST /events
+GET  /devices/{device_id}/health
+GET  /rooms/{room_id}/occupancy?window=1m|5m|1h
+GET  /alarms?since=0|<ISO-8601 timestamp>
+GET  /metrics
+```
+
+`/metrics` exposes durable Prometheus-style counters and gauges, including backlog age, deduplicated falls, processing latency p50/p95, and alarm latency p50/p95. Latency is calculated from PostgreSQL timestamps, so it survives restarts and reflects the full retained dataset:
+
+```bash
+curl http://localhost:8080/metrics
+watch -n 1 'curl -s http://localhost:8080/metrics'
+```
+
+`alarm_latency_p95_seconds` is the challenge-critical p95 from durable receipt to alarm persistence. `processing_latency_p95_seconds` covers all processed event types; `events_pending` and `backlog_oldest_seconds` show whether a burst is draining.
+
+## Verify
+
+```bash
+make test
+make smoke
+make baseline
+make burst
+make offline
+make adversarial
+
+# Configurable burst summary (defaults: 500 devices, 60 seconds)
+DEVICES=1000 DURATION=120 make stress
+
+# Requires the Compose service to be running
+make restart-check
+```
+
+`make test` treats compiler/analyzer warnings as errors (including unused `using` directives) and checks every event type's valid/invalid payload rules, required and future timestamps, out-of-order occupancy, boundary handling, and availability clamping. PostgreSQL behavior, API response shapes, deduplication, backlog drain, and restart recovery are exercised through the supplied generator/evaluator workflows above.
+
+All load and restart workflows call the repository's existing `event_generator/generate.py`; there is no second event producer. The scenario duration and device count can also be passed directly to `eval/check.py`. The supplied generator issues synchronous HTTP requests, so it validates the repository contract but does not by itself prove a 50,000 requests/second production limit. Use `events_pending`, `backlog_oldest_seconds`, and the p95 latency metrics to decide when PostgreSQL or replica capacity needs increasing.
+
+Run scored scenarios against a fresh database. The generator restarts device sequence numbers at 1, so rerunning it against retained data is correctly treated as transport redelivery. To discard local test data: `docker compose down -v`, then `docker compose up --build`.
+
+## Tradeoffs
+
+- The service deliberately runs without Orleans, SSE, a broker, or a migration framework. Durable alarm polling is the evaluator contract and reconnect mechanism.
+- Availability is `min(heartbeats in the previous five event-time minutes / 300, 1)` based on the specified ~1 Hz expectation.
+- Fall deduplication depends on the generator's exact shared timestamp for jitter copies. If hardware assigns slightly different timestamps, add a documented device-specific quiet interval.
+- Read-model history is not pruned. Add retention/partitioning only when stored volume warrants it.
+- Measured performance numbers are intentionally absent until run on a named machine and workload.
+
+---
+
 > **No prior experience required. The solution is the signal.**
 > Every submission gets feedback within 7 days. → `info@teton.ai`
 
