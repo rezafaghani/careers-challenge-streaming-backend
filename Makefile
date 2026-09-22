@@ -3,12 +3,13 @@
 PYTHON ?= python3
 SERVICE_URL ?= http://localhost:8080
 
-.PHONY: help run test stress restart-check example smoke baseline burst offline adversarial
+.PHONY: help run test load-50k stress restart-check example smoke baseline burst offline adversarial
 
 help:
 	@echo "Targets:"
 	@echo "  run            start PostgreSQL and the service"
 	@echo "  test           run focused domain checks"
+	@echo "  load-50k       send 50,000 events and report throughput/p95"
 	@echo "  stress         run a configurable burst and print metrics"
 	@echo "  restart-check  hard-kill the app and verify recovery"
 	@echo "  example        run the example stub service on :8080 (replace with yours)"
@@ -27,6 +28,9 @@ run:
 
 test:
 	dotnet run --project tests/StreamingBackend.Tests
+
+load-50k:
+	dotnet run --project tools/LoadTest -c Release
 
 stress:
 	bash scripts/stress.sh

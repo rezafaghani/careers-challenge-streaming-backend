@@ -16,41 +16,36 @@ public sealed record Alarm(
 public sealed record StorageMetrics(long Received, long Processed, long Pending, decimal OldestBacklogSeconds,
     double ProcessingP50, double ProcessingP95, long DeduplicatedFalls, double AlarmP50, double AlarmP95);
 
-public sealed class Database
+public sealed class Database : IAsyncDisposable
 {
-    private readonly string _connectionString;
+    private readonly NpgsqlDataSource _dataSource;
 
-    public Database(IConfiguration configuration) => _connectionString =
+    public Database(IConfiguration configuration) => _dataSource = NpgsqlDataSource.Create(
         configuration.GetConnectionString("postgres")
-        ?? "Host=localhost;Database=streaming;Username=streaming;Password=streaming;Pooling=true;Maximum Pool Size=200";
+        ?? "Host=localhost;Database=streaming;Username=streaming;Password=streaming;Pooling=true;Maximum Pool Size=50");
 
     public async Task Initialize(CancellationToken ct = default)
     {
-        await using var connection = await Open(ct);
-        await using var command = new NpgsqlCommand(Schema, connection);
+        await using var command = _dataSource.CreateCommand(Schema);
         await command.ExecuteNonQueryAsync(ct);
     }
 
-    public async Task StoreEvent(DeviceEvent e, CancellationToken ct)
+    public async Task StoreEvents(IEnumerable<DeviceEvent> events, CancellationToken ct)
     {
-        await using var connection = await Open(ct);
-        await using var command = new NpgsqlCommand("""
+        await using var command = _dataSource.CreateCommand("""
             INSERT INTO event_inbox(device_id,room_id,type,event_ts,seq,payload)
-            VALUES (@device,@room,@type,@ts,@seq,@payload)
+            SELECT item->>'device_id',item->>'room_id',item->>'type',(item->>'ts')::timestamptz,
+                   (item->>'seq')::bigint,item
+            FROM jsonb_array_elements(@batch::jsonb) item
             ON CONFLICT (device_id,seq) DO NOTHING
-            """, connection);
-        command.Parameters.AddWithValue("device", e.DeviceId!);
-        command.Parameters.AddWithValue("room", e.RoomId!);
-        command.Parameters.AddWithValue("type", e.Type!);
-        command.Parameters.AddWithValue("ts", e.Ts);
-        command.Parameters.AddWithValue("seq", e.Seq!.Value);
-        command.Parameters.AddWithValue("payload", NpgsqlDbType.Jsonb, JsonSerializer.Serialize(e));
+            """);
+        command.Parameters.AddWithValue("batch", NpgsqlDbType.Jsonb, JsonSerializer.Serialize(events));
         await command.ExecuteNonQueryAsync(ct);
     }
 
     public async Task<int> ProcessBatch(CancellationToken ct)
     {
-        await using var connection = await Open(ct);
+        await using var connection = await _dataSource.OpenConnectionAsync(ct);
         await using var transaction = await connection.BeginTransactionAsync(ct);
         await using var command = new NpgsqlCommand(ProcessBatchSql, connection, transaction);
         var count = await command.ExecuteNonQueryAsync(ct);
@@ -60,11 +55,10 @@ public sealed class Database
 
     public async Task<HealthSnapshot> GetHealth(string deviceId, CancellationToken ct)
     {
-        await using var connection = await Open(ct);
-        await using var command = new NpgsqlCommand("""
+        await using var command = _dataSource.CreateCommand("""
             SELECT max(event_ts), count(*) FILTER (WHERE event_ts >= now() - interval '5 minutes' AND event_ts <= now())
             FROM heartbeats WHERE device_id=@device
-            """, connection);
+            """);
         command.Parameters.AddWithValue("device", deviceId);
         await using var reader = await command.ExecuteReaderAsync(ct);
         await reader.ReadAsync(ct);
@@ -73,14 +67,13 @@ public sealed class Database
 
     public async Task<List<PresenceTransition>> GetPresence(string roomId, DateTimeOffset start, DateTimeOffset end, CancellationToken ct)
     {
-        await using var connection = await Open(ct);
-        await using var command = new NpgsqlCommand("""
+        await using var command = _dataSource.CreateCommand("""
             (SELECT event_ts,in_room FROM presence_transitions
              WHERE room_id=@room AND event_ts<@start ORDER BY event_ts DESC LIMIT 1)
             UNION ALL
             (SELECT event_ts,in_room FROM presence_transitions
              WHERE room_id=@room AND event_ts>=@start AND event_ts<=@end)
-            """, connection);
+            """);
         command.Parameters.AddWithValue("room", roomId);
         command.Parameters.AddWithValue("start", start);
         command.Parameters.AddWithValue("end", end);
@@ -93,9 +86,19 @@ public sealed class Database
 
     public async Task<List<Alarm>> GetAlarms(DateTimeOffset since, CancellationToken ct)
     {
-        await using var connection = await Open(ct);
-        await using var command = new NpgsqlCommand("SELECT event_id,room_id,event_ts,confidence,device_id FROM alarms WHERE event_ts>@since ORDER BY event_ts,event_id", connection);
+        await using var command = _dataSource.CreateCommand("SELECT event_id,room_id,event_ts,confidence,device_id FROM alarms WHERE event_ts>@since ORDER BY event_ts,event_id");
         command.Parameters.AddWithValue("since", since);
+        var alarms = new List<Alarm>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct)) alarms.Add(new(reader.GetInt64(0), reader.GetString(1),
+            reader.GetFieldValue<DateTimeOffset>(2), reader.GetDouble(3), reader.GetString(4)));
+        return alarms;
+    }
+
+    public async Task<List<Alarm>> GetAlarmsAfter(long eventId, CancellationToken ct)
+    {
+        await using var command = _dataSource.CreateCommand("SELECT event_id,room_id,event_ts,confidence,device_id FROM alarms WHERE event_id>@id ORDER BY event_id");
+        command.Parameters.AddWithValue("id", eventId);
         var alarms = new List<Alarm>();
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct)) alarms.Add(new(reader.GetInt64(0), reader.GetString(1),
@@ -105,25 +108,19 @@ public sealed class Database
 
     public async Task<StorageMetrics> GetMetrics(CancellationToken ct)
     {
-        await using var connection = await Open(ct);
-        await using var command = new NpgsqlCommand(MetricsSql, connection);
+        await using var command = _dataSource.CreateCommand(MetricsSql);
         await using var reader = await command.ExecuteReaderAsync(ct);
         await reader.ReadAsync(ct);
         return new(reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2), reader.GetDecimal(3),
             reader.GetDouble(4), reader.GetDouble(5), reader.GetInt64(6), reader.GetDouble(7), reader.GetDouble(8));
     }
 
-    private async Task<NpgsqlConnection> Open(CancellationToken ct)
-    {
-        var connection = new NpgsqlConnection(_connectionString);
-        await connection.OpenAsync(ct);
-        return connection;
-    }
+    public ValueTask DisposeAsync() => _dataSource.DisposeAsync();
 
     private const string ProcessBatchSql = """
         WITH claimed AS MATERIALIZED (
           SELECT * FROM event_inbox WHERE processed_at IS NULL
-          ORDER BY CASE WHEN type='fall_warn' THEN 0 ELSE 1 END, id LIMIT 500 FOR UPDATE SKIP LOCKED
+          ORDER BY CASE WHEN type='fall_warn' THEN 0 ELSE 1 END, id LIMIT 5000 FOR UPDATE SKIP LOCKED
         ), heartbeats_written AS (
           INSERT INTO heartbeats(device_id,event_ts,event_id)
           SELECT device_id,event_ts,id FROM claimed WHERE type='heartbeat' ON CONFLICT DO NOTHING

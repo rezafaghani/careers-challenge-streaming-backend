@@ -17,7 +17,8 @@ services:
   app:
     build: .
     environment:
-      ConnectionStrings__postgres: Host=postgres;Database=streaming;Username=streaming;Password=streaming;Pooling=true;Maximum Pool Size=200
+      ConnectionStrings__postgres: Host=postgres;Database=streaming;Username=streaming;Password=streaming;Pooling=true;Maximum Pool Size=50
+      Logging__LogLevel__Microsoft.AspNetCore: Warning
     ports:
       - "8080:8080"
     depends_on:

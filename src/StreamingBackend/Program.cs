@@ -5,10 +5,13 @@ using StreamingBackend;
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<Database>();
 builder.Services.AddSingleton<RuntimeMetrics>();
+builder.Services.AddSingleton<IngestionQueue>();
+builder.Services.AddHostedService(service => service.GetRequiredService<IngestionQueue>());
 builder.Services.AddHostedService<EventWorker>();
 builder.Services.AddOpenApi();
 var app = builder.Build();
 var database = app.Services.GetRequiredService<Database>();
+var ingestion = app.Services.GetRequiredService<IngestionQueue>();
 await database.Initialize();
 
 app.MapOpenApi();
@@ -24,7 +27,7 @@ app.MapPost("/events", async (HttpRequest request, CancellationToken ct) =>
     if (e is null) return Results.BadRequest(new { error = "invalid json" });
     var error = EventRules.Validate(e, DateTimeOffset.UtcNow);
     if (error is not null) return Results.BadRequest(new { error });
-    await database.StoreEvent(e, ct);
+    await ingestion.Store(e, ct);
     return Results.Accepted(value: new { ok = true });
 });
 
@@ -61,6 +64,44 @@ app.MapGet("/alarms", async (string? since, CancellationToken ct) =>
     if (string.IsNullOrEmpty(since) || since == "0") threshold = DateTimeOffset.MinValue;
     else if (!DateTimeOffset.TryParse(since, out threshold)) return Results.BadRequest(new { error = "since must be 0 or an ISO-8601 timestamp" });
     return Results.Ok(new { alarms = await database.GetAlarms(threshold, ct) });
+});
+
+app.MapGet("/alarms/stream", async (HttpContext context, string? since) =>
+{
+    DateTimeOffset threshold;
+    if (string.IsNullOrEmpty(since) || since == "0") threshold = DateTimeOffset.UtcNow;
+    else if (!DateTimeOffset.TryParse(since, out threshold))
+    {
+        context.Response.StatusCode = StatusCodes.Status400BadRequest;
+        return;
+    }
+
+    context.Response.Headers.ContentType = "text/event-stream";
+    context.Response.Headers.CacheControl = "no-cache";
+    context.Response.Headers.Connection = "keep-alive";
+    var cursor = long.TryParse(context.Request.Headers["Last-Event-ID"], out var lastId) ? lastId : 0;
+    var initial = cursor > 0 ? await database.GetAlarmsAfter(cursor, context.RequestAborted) : await database.GetAlarms(threshold, context.RequestAborted);
+    await Send(initial);
+
+    try
+    {
+        while (!context.RequestAborted.IsCancellationRequested)
+        {
+            await Task.Delay(100, context.RequestAborted);
+            await Send(await database.GetAlarmsAfter(cursor, context.RequestAborted));
+        }
+    }
+    catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested) { }
+
+    async Task Send(IEnumerable<Alarm> alarms)
+    {
+        foreach (var alarm in alarms)
+        {
+            cursor = Math.Max(cursor, alarm.EventId);
+            await context.Response.WriteAsync($"id: {alarm.EventId}\nevent: fall_warn\ndata: {JsonSerializer.Serialize(alarm)}\n\n", context.RequestAborted);
+        }
+        await context.Response.Body.FlushAsync(context.RequestAborted);
+    }
 });
 
 app.MapGet("/metrics", async (RuntimeMetrics runtime, CancellationToken ct) =>

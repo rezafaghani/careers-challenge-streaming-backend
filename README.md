@@ -28,7 +28,7 @@ Interactive API documentation is available at `http://localhost:8080/scalar/v1`;
 
 PostgreSQL is both the durable queue and read store. This avoids an extra broker and any unbounded in-process buffer. Orleans was considered but omitted because database constraints and row claims already provide recoverable ownership without a second state model.
 
-The application is stateless and horizontally scalable. Every replica can ingest and process; workers claim disjoint 500-row batches with `FOR UPDATE SKIP LOCKED`, and each entire batch is applied with one set-based PostgreSQL statement. Put any number of replicas behind an HTTP load balancer and point them at the same PostgreSQL database. Unique constraints make concurrent/retried processing harmless. PostgreSQL is the intentional coordination point; size its connection limit and storage throughput before raising replica count. Compose remains one app plus one database for the simplest local evaluator setup.
+The application is stateless and horizontally scalable. Every replica can ingest and process; workers claim disjoint 5,000-row batches with `FOR UPDATE SKIP LOCKED`, and each entire batch is applied with one set-based PostgreSQL statement. Put replicas behind an HTTP load balancer and point them at the same PostgreSQL database. Unique constraints make concurrent/retried processing harmless. PostgreSQL is the intentional coordination point; size its connection limit and storage throughput before raising replica count. Compose remains one app plus one database for the simplest local evaluator setup.
 
 All timestamps use `DateTimeOffset`/`timestamptz`. Presence transitions are stored in event-time order. Occupancy queries find the state immediately before the requested window, merge transitions inside it, and integrate occupied time; a late transition therefore corrects historical windows. Device health similarly uses event-time heartbeat rows.
 
@@ -41,8 +41,11 @@ POST /events
 GET  /devices/{device_id}/health
 GET  /rooms/{room_id}/occupancy?window=1m|5m|1h
 GET  /alarms?since=0|<ISO-8601 timestamp>
+GET  /alarms/stream?since=<ISO-8601 timestamp>  (SSE)
 GET  /metrics
 ```
+
+The SSE alarm stream emits only alarms already committed to PostgreSQL, polls at 100 ms, and uses each alarm's durable event ID as the SSE `id`. Browsers reconnect with `Last-Event-ID`, allowing the stream to resume without missing committed alarms. `/alarms?since=` remains the durable catch-up API.
 
 `/metrics` exposes durable Prometheus-style counters and gauges, including backlog age, deduplicated falls, processing latency p50/p95, and alarm latency p50/p95. Latency is calculated from PostgreSQL timestamps, so it survives restarts and reflects the full retained dataset:
 
@@ -66,23 +69,43 @@ make adversarial
 # Configurable burst summary (defaults: 500 devices, 60 seconds)
 DEVICES=1000 DURATION=120 make stress
 
+# 50,000 total requests, 1,000 in flight by default
+make load-50k
+CONCURRENCY=2000 REQUESTS=100000 make load-50k
+
 # Requires the Compose service to be running
 make restart-check
 ```
 
 `make test` treats compiler/analyzer warnings as errors (including unused `using` directives) and checks every event type's valid/invalid payload rules, required and future timestamps, out-of-order occupancy, boundary handling, and availability clamping. PostgreSQL behavior, API response shapes, deduplication, backlog drain, and restart recovery are exercised through the supplied generator/evaluator workflows above.
 
-All load and restart workflows call the repository's existing `event_generator/generate.py`; there is no second event producer. The scenario duration and device count can also be passed directly to `eval/check.py`. The supplied generator issues synchronous HTTP requests, so it validates the repository contract but does not by itself prove a 50,000 requests/second production limit. Use `events_pending`, `backlog_oldest_seconds`, and the p95 latency metrics to decide when PostgreSQL or replica capacity needs increasing.
+Correctness, scenario, stress, and restart workflows call the repository's existing `event_generator/generate.py`. The separate `load-50k` command exists only to create concurrency the synchronous supplied generator cannot produce. Use `events_pending`, `backlog_oldest_seconds`, and the p95 latency metrics to decide when PostgreSQL or replica capacity needs increasing.
+
+### Concurrent load result
+
+Run against a clean database:
+
+```bash
+docker compose down -v
+docker compose up -d --build
+CONCURRENCY=5000 REQUESTS=100000 make load-50k
+```
+
+The final local single-node result was 100,000/100,000 accepted and processed, 0 failures, 14,775 requests/second, client p50/p95 303/491 ms, processing p50/p95 99/237 ms, alarm persistence p50/p95 82/208 ms, and zero final backlog. This does **not** prove the 50,000 events/second target; three local app replicas still reached only about 15,700 requests/second because they shared the same local PostgreSQL and load host.
+
+The improvement from the initial 3,224 requests/second came from a bounded ingestion channel that coalesces up to 1,000 requests into one durable PostgreSQL insert, a 50-connection pool that applies backpressure, 5,000-row set-based read-model batches, fall-first claiming, and disabling per-request information logs. HTTP success is completed only after the ingestion batch commits.
+
+Additional verification used only the supplied generator: the 95-second offline scenario accepted 4,603/4,603 events with 0 failures and returned all 65 logical falls exactly once; a 5,001-device run accepted 5,064/5,064 events without registration or redeployment. SSE resume was verified by reconnecting with `Last-Event-ID` and receiving the next persisted alarm.
 
 Run scored scenarios against a fresh database. The generator restarts device sequence numbers at 1, so rerunning it against retained data is correctly treated as transport redelivery. To discard local test data: `docker compose down -v`, then `docker compose up --build`.
 
 ## Tradeoffs
 
-- The service deliberately runs without Orleans, SSE, a broker, or a migration framework. Durable alarm polling is the evaluator contract and reconnect mechanism.
+- The service deliberately runs without Orleans, a broker, or a migration framework. SSE and durable alarm polling share the same persisted alarm table.
 - Availability is `min(heartbeats in the previous five event-time minutes / 300, 1)` based on the specified ~1 Hz expectation.
 - Fall deduplication depends on the generator's exact shared timestamp for jitter copies. If hardware assigns slightly different timestamps, add a documented device-specific quiet interval.
 - Read-model history is not pruned. Add retention/partitioning only when stored volume warrants it.
-- Measured performance numbers are intentionally absent until run on a named machine and workload.
+- Local measurements describe this development machine and workload only; they are not a 50k requests/second capacity claim.
 
 ---
 
