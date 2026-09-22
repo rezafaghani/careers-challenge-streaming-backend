@@ -69,9 +69,10 @@ make adversarial
 # Configurable burst summary (defaults: 500 devices, 60 seconds)
 DEVICES=1000 DURATION=120 make stress
 
-# 50,000 total requests, 1,000 in flight by default
+# 60,000 events/second for 30 seconds, 1,000 in flight by default
 make load-50k
-CONCURRENCY=2000 REQUESTS=100000 make load-50k
+# Optional: change the rate, duration, concurrency, or service targets
+TARGET_RPS=60000 DURATION_SECONDS=30 CONCURRENCY=5000 make load-50k
 
 # Requires the Compose service to be running
 make restart-check
@@ -91,7 +92,7 @@ docker compose up -d --build
 CONCURRENCY=5000 REQUESTS=100000 make load-50k
 ```
 
-The final local single-node result was 100,000/100,000 accepted and processed, 0 failures, 14,775 requests/second, client p50/p95 303/491 ms, processing p50/p95 99/237 ms, alarm persistence p50/p95 82/208 ms, and zero final backlog. This does **not** prove the 50,000 events/second target; three local app replicas still reached only about 15,700 requests/second because they shared the same local PostgreSQL and load host.
+The load job is paced in one-second windows and attempts 60,000 events/second for 30 seconds (1.8 million total). It prints per-second accepted/failure counts, client latency p50/p95, and the service metrics after the durable backlog drains. The command measures the actual result on the host; it does not claim that every machine can sustain the target.
 
 The improvement from the initial 3,224 requests/second came from a bounded ingestion channel that coalesces up to 1,000 requests into one durable PostgreSQL insert, a 50-connection pool that applies backpressure, 5,000-row set-based read-model batches, fall-first claiming, and disabling per-request information logs. HTTP success is completed only after the ingestion batch commits.
 

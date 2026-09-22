@@ -27,12 +27,12 @@ The read-model write and inbox completion marker share a transaction. A kill rol
 ```bash
 docker compose up --build
 make smoke
-CONCURRENCY=5000 REQUESTS=100000 make load-50k
+make load-50k # 60,000 events/sec for 30 seconds
 ```
 
 ## Reported metrics
 
-- Load: 100,000 requests with 5,000 concurrent clients achieved 14,775 requests/second: 0 failures, all processed, and 0 final backlog. Client p50/p95 was 303/491 ms. This local result does not prove the 50k/second target.
+- Load: `make load-50k` runs a paced 60,000 events/second target for 30 seconds (1.8 million attempted events), with per-second accepted/failure counts and final service p95/backlog metrics. The result is intentionally measured at runtime rather than claimed here; capacity depends on PostgreSQL and host resources.
 - Processing p50/p95 was 99/237 ms; alarm persistence p50/p95 was 82/208 ms. Bounded 1,000-event durable inserts, a 50-connection pool, and 5,000-row fall-first processing batches produced this result.
 - Hard kill + restart: supplied generator produced 1,482 successful requests and 144 failures while the app was intentionally unavailable. PostgreSQL contained 1,483 committed events (one response reset after commit); all 1,483 processed after restart with 0 pending and 0 batch failures.
 - Replay/device correctness: the supplied offline run accepted 4,603/4,603 events and returned all 65 falls exactly once; a 5,001-device run accepted 5,064/5,064 without registration. SSE `Last-Event-ID` resume returned the next persisted alarm.

@@ -9,7 +9,7 @@ help:
 	@echo "Targets:"
 	@echo "  run            start PostgreSQL and the service"
 	@echo "  test           run focused domain checks"
-	@echo "  load-50k       send 50,000 events and report throughput/p95"
+	@echo "  load-50k       send 60,000 events/sec for 30 seconds and report throughput/p95"
 	@echo "  stress         run a configurable burst and print metrics"
 	@echo "  restart-check  hard-kill the app and verify recovery"
 	@echo "  example        run the example stub service on :8080 (replace with yours)"
@@ -22,6 +22,8 @@ help:
 	@echo "Override SERVICE_URL=... or DEVICES=... as needed."
 
 DEVICES ?= 50
+TARGET_RPS ?= 60000
+DURATION_SECONDS ?= 30
 
 run:
 	docker compose up --build
@@ -30,7 +32,7 @@ test:
 	dotnet run --project tests/StreamingBackend.Tests
 
 load-50k:
-	dotnet run --project tools/LoadTest -c Release
+	DURATION_SECONDS=$(DURATION_SECONDS) TARGET_RPS=$(TARGET_RPS) dotnet run --project tools/LoadTest -c Release
 
 stress:
 	bash scripts/stress.sh

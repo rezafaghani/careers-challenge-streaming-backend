@@ -5,46 +5,61 @@ using System.Net.Http.Json;
 var targets = (Environment.GetEnvironmentVariable("SERVICE_URLS")
     ?? Environment.GetEnvironmentVariable("SERVICE_URL")
     ?? "http://localhost:8080").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-var total = int.TryParse(Environment.GetEnvironmentVariable("REQUESTS"), out var requested) ? requested : 50_000;
+var duration = int.TryParse(Environment.GetEnvironmentVariable("DURATION_SECONDS"), out var seconds) ? seconds : 30;
+var targetRate = int.TryParse(Environment.GetEnvironmentVariable("TARGET_RPS"), out var rate) ? rate : 60_000;
 var concurrency = int.TryParse(Environment.GetEnvironmentVariable("CONCURRENCY"), out var parallelism) ? parallelism : 1_000;
 var run = Guid.NewGuid().ToString("N")[..8];
-var latencies = new ConcurrentBag<double>();
-var failures = 0;
+var latencies = new ConcurrentQueue<double>();
+long sent = 0;
+long failures = 0;
 var clients = targets.Select(target => new HttpClient(new SocketsHttpHandler { MaxConnectionsPerServer = concurrency })
     { BaseAddress = new Uri(target), Timeout = TimeSpan.FromMinutes(2) }).ToArray();
 using var clientScope = new ClientScope(clients);
 var metricsClient = clients[0];
 
-Console.WriteLine($"Sending {total:N0} events to {string.Join(',', targets)} with concurrency {concurrency:N0}");
+Console.WriteLine($"Sending {targetRate:N0} events/second for {duration} seconds to {string.Join(',', targets)} with concurrency {concurrency:N0}");
 var totalTimer = Stopwatch.StartNew();
-await Parallel.ForEachAsync(Enumerable.Range(0, total), new ParallelOptions { MaxDegreeOfParallelism = concurrency }, async (i, ct) =>
+for (var second = 0; second < duration; second++)
 {
-    var timer = Stopwatch.StartNew();
-    var fall = i % 10_000 == 0;
-    var payload = new
+    var secondStart = totalTimer.Elapsed;
+    await Parallel.ForEachAsync(Enumerable.Range(0, targetRate), new ParallelOptions { MaxDegreeOfParallelism = concurrency }, async (offset, ct) =>
     {
-        device_id = $"load-{run}-{i % 5_000:D4}",
-        room_id = $"load-room-{i % 2_500:D4}",
-        type = fall ? "fall_warn" : "heartbeat",
-        ts = DateTimeOffset.UtcNow,
-        seq = i / 5_000,
-        confidence = fall ? .95 : (double?)null
-    };
-    try
-    {
-        using var response = await clients[i % clients.Length].PostAsJsonAsync("/events", payload, ct);
-        if (!response.IsSuccessStatusCode) Interlocked.Increment(ref failures);
-    }
-    catch (Exception)
-    {
-        Interlocked.Increment(ref failures);
-    }
-    latencies.Add(timer.Elapsed.TotalMilliseconds);
-});
+        var i = (long)second * targetRate + offset;
+        var timer = Stopwatch.StartNew();
+        var fall = i % 10_000 == 0;
+        var payload = new
+        {
+            device_id = $"load-{run}-{i % 5_000:D4}",
+            room_id = $"load-room-{i % 2_500:D4}",
+            type = fall ? "fall_warn" : "heartbeat",
+            ts = DateTimeOffset.UtcNow,
+            seq = i / 5_000,
+            confidence = fall ? .95 : (double?)null
+        };
+        try
+        {
+            using var response = await clients[(int)(i % clients.Length)].PostAsJsonAsync("/events", payload, ct);
+            if (response.IsSuccessStatusCode) Interlocked.Increment(ref sent);
+            else Interlocked.Increment(ref failures);
+        }
+        catch (Exception)
+        {
+            Interlocked.Increment(ref failures);
+        }
+        latencies.Enqueue(timer.Elapsed.TotalMilliseconds);
+        while (latencies.Count > 100_000) latencies.TryDequeue(out _);
+    });
+
+    var wait = TimeSpan.FromSeconds(second + 1) - (totalTimer.Elapsed - secondStart);
+    if (wait > TimeSpan.Zero) await Task.Delay(wait);
+    Console.WriteLine($"second {second + 1}/{duration}: sent={sent:N0} failures={failures:N0}");
+}
 totalTimer.Stop();
 
 var ordered = latencies.Order().ToArray();
-Console.WriteLine($"requests_per_second {total / totalTimer.Elapsed.TotalSeconds:F1}");
+Console.WriteLine($"requests_per_second {sent / totalTimer.Elapsed.TotalSeconds:F1}");
+Console.WriteLine($"target_requests {targetRate * (long)duration:N0}");
+Console.WriteLine($"accepted_requests {sent:N0}");
 Console.WriteLine($"http_failures {failures}");
 Console.WriteLine($"client_latency_p50_ms {Percentile(ordered, .50):F1}");
 Console.WriteLine($"client_latency_p95_ms {Percentile(ordered, .95):F1}");
